@@ -1,6 +1,6 @@
 import { convertAccount, convertAccounts, convertTransactions, splitAccountsByCurrency } from '../converters'
 import { CardTransactionRow, ParsedAccountRow } from '../models'
-import { AccountOrCard, AccountType } from '../../../types/zenmoney'
+import { AccountOrCard, AccountType, ExtendedTransaction } from '../../../types/zenmoney'
 
 // Mock the ZenMoney global used by convertTransaction() internally.
 beforeEach(() => {
@@ -241,6 +241,77 @@ describe('convertTransactions — dedup', () => {
 
     expect(result).toHaveLength(1)
   })
+
+  it('keeps both when same content but one has ID and other is hash-based', () => {
+    const row1 = makeWebRow({
+      TransactionID: '111',
+      TransferID: undefined,
+      TransactionReference: undefined,
+      Description: 'Identical payment',
+      Amount: '75',
+      DocDate: '15.01.2025',
+      CreditDebitIndicator: 'DBIT'
+    })
+    const row2 = makeWebRow({
+      TransactionID: undefined,
+      TransferID: undefined,
+      TransactionReference: undefined,
+      Description: 'Identical payment',
+      Amount: '75',
+      DocDate: '15.01.2025',
+      CreditDebitIndicator: 'DBIT'
+    })
+
+    const result = convertTransactions([row1, row2], [], [account])
+
+    expect(result).toHaveLength(2)
+  })
+
+  it('filters second row when same content and both IDs are hash-based', () => {
+    const row1 = makeWebRow({
+      TransactionID: undefined,
+      TransferID: undefined,
+      TransactionReference: undefined,
+      Description: 'Duplicate payment',
+      Amount: '60',
+      DocDate: '15.01.2025',
+      CreditDebitIndicator: 'DBIT'
+    })
+    const row2 = makeWebRow({
+      TransactionID: undefined,
+      TransferID: undefined,
+      TransactionReference: undefined,
+      Description: 'Duplicate payment',
+      Amount: '60',
+      DocDate: '15.01.2025',
+      CreditDebitIndicator: 'DBIT'
+    })
+
+    const result = convertTransactions([row1, row2], [], [account])
+
+    expect(result).toHaveLength(1)
+  })
+
+  it('dedupes same transaction with 1-second date difference by primary key', () => {
+    const row1 = makeWebRow({
+      TransactionID: 'TX1',
+      Description: 'Payment',
+      Amount: '100',
+      DocDate: '01/03/2024 10:00:00',
+      CreditDebitIndicator: 'DBIT'
+    })
+    const row2 = makeWebRow({
+      TransactionID: 'TX1',
+      Description: 'Payment',
+      Amount: '100',
+      DocDate: '01/03/2024 10:00:01',
+      CreditDebitIndicator: 'DBIT'
+    })
+
+    const result = convertTransactions([row1, row2], [], [account])
+
+    expect(result).toHaveLength(1)
+  })
 })
 
 // ─── convertTransactions — amount/currency ───────────────────────────────────
@@ -392,6 +463,95 @@ describe('convertTransactions — skipped accounts', () => {
     const result = convertTransactions([row], [], [account])
 
     expect(result).toHaveLength(0)
+  })
+})
+
+// ─── convertTransactions — groupKeys ─────────────────────────────────────────
+
+describe('convertTransactions -- groupKeys', () => {
+  const account = makeConvertedAccount()
+
+  it('web row with TransferID produces groupKeys containing the TransferID', () => {
+    const row = makeWebRow({ TransferID: '5678', TransactionID: '1234' })
+
+    const result = convertTransactions([row], [], [account]) as ExtendedTransaction[]
+
+    expect(result).toHaveLength(1)
+    expect(result[0].groupKeys).toEqual(['5678'])
+  })
+
+  it('web row without TransferID produces groupKeys containing null', () => {
+    const row = makeWebRow({ TransactionID: '1234', TransferID: undefined })
+
+    const result = convertTransactions([row], [], [account]) as ExtendedTransaction[]
+
+    expect(result).toHaveLength(1)
+    expect(result[0].groupKeys).toEqual([null])
+  })
+
+  it('PSD2 row with transactionId produces groupKeys containing the transactionId', () => {
+    const row = makePsd2Row({ transactionId: 'psd2-tx-001' })
+
+    const result = convertTransactions([row], [], [account]) as ExtendedTransaction[]
+
+    expect(result).toHaveLength(1)
+    expect(result[0].groupKeys).toEqual(['psd2-tx-001'])
+  })
+
+  it('PSD2 row without transactionId or entryReference produces groupKeys containing null', () => {
+    const row = makePsd2Row({
+      transactionId: undefined,
+      entryReference: undefined
+    })
+
+    const result = convertTransactions([row], [], [account]) as ExtendedTransaction[]
+
+    expect(result).toHaveLength(1)
+    expect(result[0].groupKeys).toEqual([null])
+  })
+
+  it('web row with TransactionReference (no TransferID) produces groupKeys containing the reference', () => {
+    const row = makeWebRow({
+      TransferID: undefined,
+      TransactionReference: 'REF-999'
+    })
+
+    const result = convertTransactions([row], [], [account]) as ExtendedTransaction[]
+
+    expect(result).toHaveLength(1)
+    expect(result[0].groupKeys).toEqual(['REF-999'])
+  })
+
+  it('cross-account transfer: both sides share the same groupKey', () => {
+    const account1 = makeConvertedAccount({
+      id: 'GE00BB0000000000000001',
+      syncIds: ['GE00BB0000000000000001']
+    })
+    const account2 = makeConvertedAccount({
+      id: 'GE00BB0000000000000002',
+      syncIds: ['GE00BB0000000000000002']
+    })
+
+    const outgoing = makeWebRow({
+      TransferID: '5678',
+      TransactionID: 'TX-OUT',
+      AccountIban: 'GE00BB0000000000000001',
+      Amount: '200',
+      CreditDebitIndicator: 'DBIT'
+    })
+    const incoming = makeWebRow({
+      TransferID: '5678',
+      TransactionID: 'TX-IN',
+      AccountIban: 'GE00BB0000000000000002',
+      Amount: '200',
+      CreditDebitIndicator: 'CRDT'
+    })
+
+    const result = convertTransactions([outgoing, incoming], [], [account1, account2]) as ExtendedTransaction[]
+
+    expect(result).toHaveLength(2)
+    expect(result[0].groupKeys).toEqual(['5678'])
+    expect(result[1].groupKeys).toEqual(['5678'])
   })
 })
 

@@ -1,4 +1,4 @@
-import { AccountOrCard, AccountType, Transaction } from '../../types/zenmoney'
+import { AccountOrCard, AccountType, ExtendedTransaction } from '../../types/zenmoney'
 import { CardTransactionRow, ParsedAccountRow } from './models'
 import { uniqueStrings, parseNumber, normalizeCurrencyToken, trimOrUndefined, isAmountObject } from './utils'
 
@@ -302,13 +302,47 @@ function extractMovementId (row: CardTransactionRow, accountId: string, amount: 
     hashFallbackId(accountId, amount, dateIso, description)
 }
 
+// ─── Cross-account transfer grouping ──────────────────────────────────────────
+// Extract a stable group key for cross-account transfer matching.
+// When the same real-world transfer appears on both sender and receiver accounts,
+// both sides share the same TransferID (web) or transactionId (PSD2).
+// ZenMoney uses groupKeys to auto-merge them.
+// Returns null for non-transfer transactions (no grouping).
+function extractGroupKey (row: CardTransactionRow): string | null {
+  if (isWebRow(row)) {
+    // Web path: TransferID is the canonical transfer identifier.
+    // TransactionID is per-account, TransferID is per-transfer.
+    const transferId = row.TransferID != null ? String(row.TransferID).trim() : ''
+    if (transferId !== '') {
+      return transferId
+    }
+    // Fallback: TransactionReference may link both sides.
+    const txnRef = trimOrUndefined(row.TransactionReference)
+    if (txnRef != null) {
+      return txnRef
+    }
+    return null
+  }
+  // PSD2 path: transactionId is shared across both sides of a transfer.
+  const psd2Id = trimOrUndefined(row.transactionId)
+  if (psd2Id != null) {
+    return psd2Id
+  }
+  // entryReference may also link both sides.
+  const entryRef = trimOrUndefined(row.entryReference)
+  if (entryRef != null) {
+    return entryRef
+  }
+  return null
+}
+
 // ─── Main conversion ───────────────────────────────────────────────────────────
 
 function convertTransaction (
   row: CardTransactionRow,
   hold: boolean,
   accountIndex: Map<string, AccountOrCard[]>
-): Transaction | null {
+): ExtendedTransaction | null {
   const accountIban = extractAccountIban(row)
   if (accountIban == null) {
     return null
@@ -342,6 +376,11 @@ function convertTransaction (
     ? { fullTitle: merchantTitle, mcc: null, location: null } as const
     : null
 
+  // Cross-account transfer dedup: when TransferID (web) or transactionId (PSD2)
+  // is present, use it as groupKey so ZenMoney auto-merges both sides of a transfer.
+  // Pattern: Credo-GE, TBC-GE, Bank of Georgia all use this mechanism.
+  const groupKey = extractGroupKey(row)
+
   return {
     hold,
     date,
@@ -355,7 +394,8 @@ function convertTransaction (
       }
     ],
     merchant,
-    comment: description !== '' ? description : null
+    comment: description !== '' ? description : null,
+    groupKeys: [groupKey]
   }
 }
 
@@ -365,9 +405,9 @@ export function convertTransactions (
   accounts: AccountOrCard[],
   fromDate?: Date,
   toDate?: Date
-): Transaction[] {
+): ExtendedTransaction[] {
   const accountIndex = buildAccountIndex(accounts)
-  const out: Transaction[] = []
+  const out: ExtendedTransaction[] = []
   const dedupe = new Set<string>()
   // Secondary dedup (data-importer's deduplicateByDescriptionDate).
   const contentDedupe = new Map<string, string>()
@@ -398,7 +438,10 @@ export function convertTransactions (
         ? String(movement.account.id)
         : ''
       const movementSum = movement.sum == null ? '' : String(movement.sum)
-      const dedupeKey = `${movement.id ?? ''}|${movementAccountId}|${movementSum}|${converted.date.toISOString()}|${String(hold)}`
+      // Use Y-m-d date only (not full ISO) to avoid millisecond drift causing duplicates.
+      // Matches the secondary dedup's date precision.
+      const dateOnly = formatDateOnly(converted.date)
+      const dedupeKey = `${movement.id ?? ''}|${movementAccountId}|${movementSum}|${dateOnly}|${String(hold)}`
       if (dedupe.has(dedupeKey)) {
         continue
       }
@@ -406,12 +449,13 @@ export function convertTransactions (
       // Secondary dedup by content: description + date + amount.
       // Data-importer uses toDateString() (Y-m-d only) for the content key, NOT full ISO timestamp.
       // If both have distinct non-empty movement IDs, they are genuinely different transactions.
-      const dateOnly = formatDateOnly(converted.date)
       const contentKey = `${movementAccountId}|${converted.comment ?? ''}|${dateOnly}|${movementSum}`
       const previousId = contentDedupe.get(contentKey)
       if (previousId !== undefined) {
         const currentId = movement.id ?? ''
-        if (currentId === '' || previousId === '' || currentId === previousId) {
+        // Only filter when BOTH IDs are empty (truly ambiguous) or IDs match exactly.
+        // When one has an ID and the other doesn't, they may be different transactions.
+        if ((currentId === '' && previousId === '') || currentId === previousId) {
           continue
         }
       }

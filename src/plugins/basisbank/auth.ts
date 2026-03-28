@@ -1,15 +1,19 @@
 import cheerio from 'cheerio'
 import { InvalidLoginOrPasswordError, InvalidOtpCodeError, TemporaryError } from '../../errors'
-import { request, asStringBody, getHeader, parseJsonBody, containsLoginForm, isDeadSessionPayload } from './http'
+import { request, asStringBody, getHeader, containsLoginForm, BasisbankAuthError, isBasisbankAuthError } from './http'
 import type { FetchResponse } from './http'
-import { Auth, AuthFailureKind, CookieShape, Session } from './models'
+import { Auth, CookieShape, Session } from './models'
 import { isNonEmptyString, isRecord, normalizeWhitespace } from './utils'
+import { callCardModule, checkCardSessionAlive } from './cardModule'
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 export const LOGIN_PAGE_PATH = '/Login.aspx'
 export const BALANCE_PAGE_PATH = '/Balance.aspx'
-export const CARD_PAGE_PATH = '/Products/Cards/Default.aspx'
+// Re-export for consumers that import from auth.ts.
+export { CARD_PAGE_PATH } from './cardModule'
+export { callCardModule, checkCardSessionAlive }
+export { BasisbankAuthError, isBasisbankAuthError }
 export const LOGIN_EVENT_TARGET = 'ctl00$ContentPlaceHolder1$LoginLBTN'
 export const LOGIN_FIELD = 'ctl00$ContentPlaceHolder1$UTXT'
 export const PASSWORD_FIELD = 'ctl00$ContentPlaceHolder1$PTXT'
@@ -23,17 +27,6 @@ export const AUTH_EXPIRY_SKEW_MS = 5 * 60 * 1000
 // ─── Module-level state ──────────────────────────────────────────────────────
 
 export const balancePageCache = new WeakMap<Session, string>()
-
-// ─── Auth error class ────────────────────────────────────────────────────────
-
-export class BasisbankAuthError extends TemporaryError {
-  readonly kind: AuthFailureKind
-
-  constructor (kind: AuthFailureKind, message: string) {
-    super(message)
-    this.kind = kind
-  }
-}
 
 // ─── Preference / device helpers ─────────────────────────────────────────────
 
@@ -67,10 +60,6 @@ export function generateDeviceId (): string {
     hex += alphabet[Math.floor(Math.random() * alphabet.length)]
   }
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
-}
-
-export function isBasisbankAuthError (error: unknown): error is BasisbankAuthError {
-  return error instanceof BasisbankAuthError
 }
 
 // ─── Cookie expiry ───────────────────────────────────────────────────────────
@@ -602,99 +591,17 @@ export async function resetSessionState (session: Session): Promise<void> {
   session.auth.trustedDeviceExpiresAt = undefined
 }
 
-// ─── CardModule caller ───────────────────────────────────────────────────────
-
-export async function callCardModule (funq: string, form: Record<string, string>): Promise<unknown> {
-  const response = await request({
-    method: 'POST',
-    path: `/Handlers/CardModule.ashx?funq=${encodeURIComponent(funq)}`,
-    form,
-    accept: 'application/json, text/javascript, */*; q=0.01',
-    refererPath: CARD_PAGE_PATH,
-    headers: {
-      'X-Requested-With': 'XMLHttpRequest'
-    },
-    redirect: 'manual'
-  })
-
-  // Data-importer: CardModule 302 redirect handling (GetTransactionsRequest lines 1614-1684).
-  // Follow the redirect, check the body for DeadSession/login form.
-  if (response.status === 302) {
-    const location = getHeader(response, 'Location')
-    if (location != null && /\/Login\.aspx/i.test(location)) {
-      throw new BasisbankAuthError('cardmodule-login-form', `CardModule redirected to login (${funq})`)
-    }
-    if (location == null || location.trim() === '') {
-      throw new BasisbankAuthError('cardmodule-status', `CardModule returned 302 with empty location (${funq})`)
-    }
-    const redirected = await request({
-      method: 'GET',
-      path: location,
-      accept: 'application/json, text/javascript, */*; q=0.01',
-      refererPath: CARD_PAGE_PATH,
-      headers: {
-        'X-Requested-With': 'XMLHttpRequest'
-      }
-    })
-    if ([401, 403, 440].includes(redirected.status)) {
-      throw new BasisbankAuthError('cardmodule-status', `CardModule auth required after redirect (${funq}, ${redirected.status})`)
-    }
-    const redirectBody = asStringBody(redirected).trim()
-    if (isDeadSessionPayload(redirectBody)) {
-      throw new BasisbankAuthError('dead-session', `CardModule session expired after redirect (${funq})`)
-    }
-    if (redirectBody.startsWith('<') && containsLoginForm(redirectBody)) {
-      throw new BasisbankAuthError('cardmodule-login-form', `CardModule session is not authorized after redirect (${funq})`)
-    }
-    if (redirectBody === '' || redirectBody.toLowerCase() === 'null') {
-      return null
-    }
-    return parseJsonBody(redirected, `CardModule:${funq}`)
-  }
-
-  if ([401, 403, 440].includes(response.status)) {
-    throw new BasisbankAuthError('cardmodule-status', `CardModule auth required (${funq}, ${response.status})`)
-  }
-
-  if (response.status < 200 || response.status >= 300) {
-    throw new TemporaryError(`CardModule request failed (${funq}, ${response.status})`)
-  }
-
-  const bodyText = asStringBody(response).trim()
-  // Data-importer: checks for DeadSession in body BEFORE login form check (line 3021).
-  if (isDeadSessionPayload(bodyText)) {
-    throw new BasisbankAuthError('dead-session', `CardModule session expired (${funq})`)
-  }
-  if (bodyText.startsWith('<') && containsLoginForm(bodyText)) {
-    throw new BasisbankAuthError('cardmodule-login-form', `CardModule session is not authorized (${funq})`)
-  }
-
-  return parseJsonBody(response, `CardModule:${funq}`)
-}
-
-// ─── Session check ───────────────────────────────────────────────────────────
-
-export async function checkCardSessionAlive (): Promise<boolean> {
-  try {
-    const payload = await callCardModule('checksession', {})
-    return !isDeadSessionPayload(payload)
-  } catch (error) {
-    return false
-  }
-}
-
 // ─── Auth entry point ────────────────────────────────────────────────────────
 
 export async function authorizeIfNeeded (session: Session, { forceReauth = false }: { forceReauth?: boolean } = {}): Promise<string> {
-  if (session.auth.login != null && session.auth.login !== session.login) {
-    forceReauth = true
-  }
-  if (isAuthExpiryReached(session.auth)) {
+  const loginChanged = session.auth.login != null && session.auth.login !== session.login
+  const authExpired = isAuthExpiryReached(session.auth)
+  if (authExpired) {
     console.warn('[basisbank] stored auth metadata is expired/near-expired; forcing re-auth')
-    forceReauth = true
   }
+  const shouldForceReauth = forceReauth || loginChanged || authExpired
 
-  if (forceReauth) {
+  if (shouldForceReauth) {
     await resetSessionState(session)
   } else {
     try {
@@ -704,7 +611,7 @@ export async function authorizeIfNeeded (session: Session, { forceReauth = false
     }
   }
 
-  if (!forceReauth) {
+  if (!shouldForceReauth) {
     const alive = await checkCardSessionAlive()
     if (alive) {
       try {

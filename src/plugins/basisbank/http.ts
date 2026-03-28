@@ -1,7 +1,7 @@
 import { stringify } from 'querystring'
 import { fetch, FetchOptions, FetchResponse } from '../../common/network'
 import { TemporaryError } from '../../errors'
-import { RequestOptions } from './models'
+import { AuthFailureKind, RequestOptions } from './models'
 import { isRecord } from './utils'
 
 export type { FetchResponse } from '../../common/network'
@@ -16,6 +16,21 @@ export const MAX_TRANSIENT_RETRY_ATTEMPTS = 4
 export const BASE_RETRY_DELAY_MS = 450
 // Data-importer retryable status codes (line 1560).
 export const RETRYABLE_STATUS_CODES = new Set([429, 500, 502, 503, 504, 520, 522, 524])
+
+// ─── Auth error class ────────────────────────────────────────────────────────
+
+export class BasisbankAuthError extends TemporaryError {
+  readonly kind: AuthFailureKind
+
+  constructor (kind: AuthFailureKind, message: string) {
+    super(message)
+    this.kind = kind
+  }
+}
+
+export function isBasisbankAuthError (error: unknown): error is BasisbankAuthError {
+  return error instanceof BasisbankAuthError
+}
 
 // ─── Low-level helpers ───────────────────────────────────────────────────────
 
