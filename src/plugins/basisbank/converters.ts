@@ -1,54 +1,6 @@
 import { AccountOrCard, AccountType, Transaction } from '../../types/zenmoney'
 import { CardTransactionRow, ParsedAccountRow } from './models'
-
-function uniqueStrings (values: Array<string | undefined>): string[] {
-  const out: string[] = []
-  for (const value of values) {
-    if (value == null) {
-      continue
-    }
-    const normalized = value.trim()
-    if (normalized === '' || out.includes(normalized)) {
-      continue
-    }
-    out.push(normalized)
-  }
-  return out
-}
-
-function parseNumber (value: unknown): number | null {
-  if (typeof value === 'number') {
-    return Number.isFinite(value) ? value : null
-  }
-
-  if (typeof value === 'string') {
-    const compact = value
-      .replace(/\u00a0/g, '')
-      .replace(/\s/g, '')
-      .replace(/[^\d,().+-]/g, '')
-
-    if (compact === '') {
-      return null
-    }
-
-    let normalized = compact
-    const wrappedInBrackets = normalized.startsWith('(') && normalized.endsWith(')')
-    if (wrappedInBrackets) {
-      normalized = `-${normalized.slice(1, -1)}`
-    }
-
-    const commaIndex = normalized.lastIndexOf(',')
-    const dotIndex = normalized.lastIndexOf('.')
-    normalized = commaIndex > dotIndex
-      ? normalized.replace(/\./g, '').replace(',', '.')
-      : normalized.replace(/,/g, '')
-
-    const parsed = Number(normalized)
-    return Number.isFinite(parsed) ? parsed : null
-  }
-
-  return null
-}
+import { uniqueStrings, parseNumber, normalizeCurrencyToken, trimOrUndefined, isAmountObject } from './utils'
 
 function parseDateFromParts (
   dayRaw: string,
@@ -73,6 +25,16 @@ function parseDateFromParts (
     return null
   }
   return date
+}
+
+/**
+ * Format a Date as YYYY-MM-DD string (matching data-importer's toDateString).
+ */
+function formatDateOnly (date: Date): string {
+  const y = date.getFullYear()
+  const m = String(date.getMonth() + 1).padStart(2, '0')
+  const d = String(date.getDate()).padStart(2, '0')
+  return `${y}-${m}-${d}`
 }
 
 function parseTransactionDate (value: unknown): Date | null {
@@ -109,10 +71,6 @@ function parseTransactionDate (value: unknown): Date | null {
   return Number.isNaN(parsed.getTime()) ? null : parsed
 }
 
-function trimOrUndefined (value: unknown): string | undefined {
-  return typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined
-}
-
 function toMovementId (value: unknown): string | null {
   if (value == null) {
     return null
@@ -121,8 +79,28 @@ function toMovementId (value: unknown): string | null {
   return asString === '' ? null : asString
 }
 
-function buildAccountIndex (accounts: AccountOrCard[]): Map<string, AccountOrCard> {
-  const map = new Map<string, AccountOrCard>()
+/**
+ * Stable fallback ID when TransactionID/TransferID/TransactionReference are all missing.
+ * Matches data-importer: hash of [baseAccountId, amount, date, description].
+ * Uses base account ID without #currency suffix for cross-import stability.
+ */
+function hashFallbackId (accountId: string, amount: number, dateIso: string, description: string): string {
+  const baseAccountId = accountId.includes('#') ? accountId.slice(0, accountId.indexOf('#')) : accountId
+  const payload = JSON.stringify([baseAccountId, String(amount), dateIso, description])
+  // FNV-1a 32-bit hash — sufficient for dedup keys within a sync batch.
+  let hash = 0x811c9dc5
+  for (let i = 0; i < payload.length; i++) {
+    hash ^= payload.charCodeAt(i)
+    hash = Math.imul(hash, 0x01000193)
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0')
+}
+
+// Build index mapping sync IDs to *all* matching accounts.
+// When multi-currency splitting creates IBAN#EUR and IBAN#USD, the base IBAN
+// maps to both. resolveAccount() picks the correct one by currency.
+function buildAccountIndex (accounts: AccountOrCard[]): Map<string, AccountOrCard[]> {
+  const map = new Map<string, AccountOrCard[]>()
   for (const account of accounts) {
     const keys = [account.id, ...account.syncIds]
     for (const key of keys) {
@@ -130,11 +108,43 @@ function buildAccountIndex (accounts: AccountOrCard[]): Map<string, AccountOrCar
       if (normalized === '') {
         continue
       }
-      map.set(normalized, account)
-      map.set(normalized.toUpperCase(), account)
+      for (const variant of [normalized, normalized.toUpperCase()]) {
+        const existing = map.get(variant)
+        if (existing != null) {
+          if (!existing.includes(account)) {
+            existing.push(account)
+          }
+        } else {
+          map.set(variant, [account])
+        }
+      }
     }
   }
   return map
+}
+
+// Resolve the best account for a transaction from the multi-account index.
+// When currency-scoped accounts exist (IBAN#EUR, IBAN#USD), pick the one
+// whose instrument matches the transaction currency.
+function resolveAccount (
+  accountIndex: Map<string, AccountOrCard[]>,
+  accountIban: string,
+  transactionCurrency: string | undefined
+): AccountOrCard | undefined {
+  const candidates = accountIndex.get(accountIban) ?? accountIndex.get(accountIban.toUpperCase())
+  if (candidates == null || candidates.length === 0) {
+    return undefined
+  }
+  if (candidates.length === 1) {
+    return candidates[0]
+  }
+  if (transactionCurrency != null && transactionCurrency !== '') {
+    const matched = candidates.find(a => a.instrument === transactionCurrency)
+    if (matched != null) {
+      return matched
+    }
+  }
+  return candidates.find(a => !a.id.includes('#')) ?? candidates[0]
 }
 
 export function convertAccount (row: ParsedAccountRow): AccountOrCard {
@@ -161,40 +171,176 @@ export function convertAccounts (rows: ParsedAccountRow[]): AccountOrCard[] {
   return [...byId.values()]
 }
 
+// ─── Row classification ────────────────────────────────────────────────────────
+// Data-importer's isWebRow: presence of CardModule-style PascalCase fields.
+function isWebRow (row: CardTransactionRow): boolean {
+  return row.TransactionID !== undefined ||
+    row.AccountIban !== undefined ||
+    row.DocDate !== undefined ||
+    row.Ccy !== undefined ||
+    row.TransferID !== undefined
+}
+
+// ─── Amount extraction with credit/debit indicator ─────────────────────────────
+// Matching data-importer's normalizeTransaction/normalizeWebTransaction sign logic.
+function extractAmount (row: CardTransactionRow): number | null {
+  let raw: number | null
+
+  if (isWebRow(row)) {
+    // CardModule format: flat Amount field.
+    raw = parseNumber(row.Amount)
+  } else {
+    // PSD2 API format: nested transactionAmount.amount or amount.amount or flat amount.
+    const nested = row.transactionAmount?.amount ??
+      (isAmountObject(row.amount) ? row.amount.amount : row.amount)
+    raw = parseNumber(nested)
+  }
+
+  if (raw == null || raw === 0) {
+    return raw
+  }
+
+  // Apply credit/debit indicator (data-importer lines 1857-1863 / 1903-1909).
+  const indicator = String(
+    row.CreditDebitIndicator ?? row.creditDebitIndicator ?? row.debitCreditIndicator ?? ''
+  ).toUpperCase()
+
+  if (indicator.includes('DBIT') || indicator.includes('DEBIT')) {
+    raw = -1 * Math.abs(raw)
+  } else if (indicator.includes('CRDT') || indicator.includes('CREDIT')) {
+    raw = Math.abs(raw)
+  }
+
+  return raw
+}
+
+// ─── Date extraction with fallback chain ───────────────────────────────────────
+// Matching data-importer: Web → DocDate > DateTime > Date > today ;
+//                         PSD2 -> bookingDateTime > bookingDate > valueDate > transactionDate > date > today
+// Data-importer falls back to date('Y-m-d') (today) for unparseable dates (lines 1869, 1914).
+function extractDate (row: CardTransactionRow): Date {
+  if (isWebRow(row)) {
+    return parseTransactionDate(row.DocDate) ??
+      parseTransactionDate(row.DateTime) ??
+      parseTransactionDate(row.Date) ??
+      todayDate()
+  }
+  return parseTransactionDate(row.bookingDateTime) ??
+    parseTransactionDate(row.bookingDate) ??
+    parseTransactionDate(row.valueDate) ??
+    parseTransactionDate(row.transactionDate) ??
+    parseTransactionDate(row.date) ??
+    todayDate()
+}
+
+function todayDate (): Date {
+  const now = new Date()
+  return new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0)
+}
+
+// ─── Description extraction with PSD2 structured fields ────────────────────────
+// Matching data-importer: remittanceInformationUnstructuredArray (joined) >
+//   remittanceInformationUnstructured > additionalInformation > description
+function extractDescription (row: CardTransactionRow): string {
+  if (!isWebRow(row)) {
+    // PSD2 path.
+    // Data-importer line 1872: trim(implode(' ', array)) — joins raw elements, trims outer.
+    if (Array.isArray(row.remittanceInformationUnstructuredArray) && row.remittanceInformationUnstructuredArray.length > 0) {
+      const joined = row.remittanceInformationUnstructuredArray.map(s => String(s)).join(' ').trim()
+      if (joined !== '') {
+        return joined
+      }
+    }
+    // Data-importer line 1875: $row['remittanceInformationUnstructured'] ?? $row['additionalInformation'] ?? $row['description']
+    // Note: data-importer uses lowercase 'description' as final PSD2 fallback (not PascalCase 'Description').
+    return trimOrUndefined(row.remittanceInformationUnstructured) ??
+      trimOrUndefined(row.additionalInformation) ??
+      trimOrUndefined(row.description) ??
+      trimOrUndefined(row.Description) ??
+      ''
+  }
+  return trimOrUndefined(row.Description) ?? ''
+}
+
+// ─── Merchant / counterparty extraction ────────────────────────────────────────
+// Matching data-importer: creditorName > debtorName > counterpartyName > Description > CardPan
+function extractMerchantTitle (row: CardTransactionRow): string | undefined {
+  if (!isWebRow(row)) {
+    return trimOrUndefined(row.creditorName) ??
+      trimOrUndefined(row.debtorName) ??
+      trimOrUndefined(row.counterpartyName)
+  }
+  // For CardModule rows, Description doubles as merchant.
+  // CardPan (masked card number) is last resort.
+  return trimOrUndefined(row.Description) ?? trimOrUndefined(row.CardPan)
+}
+
+// ─── Account ID resolution ─────────────────────────────────────────────────────
+// Matching data-importer: AccountIban > MainAccountID > AccountIbanEncrypted > accountId > sourceAccountId.
+function extractAccountIban (row: CardTransactionRow): string | undefined {
+  return trimOrUndefined(row.AccountIban) ??
+    (row.MainAccountID != null ? trimOrUndefined(String(row.MainAccountID)) : undefined) ??
+    trimOrUndefined(row.AccountIbanEncrypted) ??
+    trimOrUndefined(row.accountId) ??
+    trimOrUndefined(row.sourceAccountId)
+}
+
+// ─── External ID with full fallback chain ──────────────────────────────────────
+// Data-importer web: TransactionID > TransactionReference > TransferID > hash
+// Data-importer PSD2: transactionId > entryReference > internalTransactionId > hash
+function extractMovementId (row: CardTransactionRow, accountId: string, amount: number, dateIso: string, description: string): string {
+  if (isWebRow(row)) {
+    return toMovementId(row.TransactionID) ??
+      trimOrUndefined(row.TransactionReference) ??
+      toMovementId(row.TransferID) ??
+      hashFallbackId(accountId, amount, dateIso, description)
+  }
+  // PSD2 path: data-importer does NOT fall through to CardModule-style fields.
+  return toMovementId(row.transactionId) ??
+    trimOrUndefined(row.entryReference) ??
+    toMovementId(row.internalTransactionId) ??
+    hashFallbackId(accountId, amount, dateIso, description)
+}
+
+// ─── Main conversion ───────────────────────────────────────────────────────────
+
 function convertTransaction (
   row: CardTransactionRow,
   hold: boolean,
-  accountIndex: Map<string, AccountOrCard>
+  accountIndex: Map<string, AccountOrCard[]>
 ): Transaction | null {
-  const accountIban = trimOrUndefined(row.AccountIban)
+  const accountIban = extractAccountIban(row)
   if (accountIban == null) {
     return null
   }
 
-  const account = accountIndex.get(accountIban) ?? accountIndex.get(accountIban.toUpperCase())
+  // Resolve transaction currency early so we can route to the correct
+  // currency-scoped account (matching data-importer's filterTransactions
+  // which filters by expectedCurrency per scoped account).
+  const rawCurrency = extractTransactionCurrency(row)
+  const account = resolveAccount(accountIndex, accountIban, rawCurrency)
   if (account == null || ZenMoney.isAccountSkipped(account.id)) {
     return null
   }
 
-  const amount = parseNumber(row.Amount)
-  if (amount == null) {
-    return null
-  }
-  // ZenMoney requires at least one non-zero side (income/outcome); skip zero-sum bank rows.
-  if (amount === 0) {
+  const amount = extractAmount(row)
+  if (amount == null || amount === 0) {
     return null
   }
 
-  const date = parseTransactionDate(row.DocDate)
-  if (date == null) {
-    return null
-  }
+  const date = extractDate(row)
 
-  const instrument = trimOrUndefined(row.Ccy) ?? account.instrument
-  const movementId = toMovementId(row.TransactionID) ??
-    toMovementId(row.TransferID) ??
-    trimOrUndefined(row.TransactionReference) ??
-    null
+  const instrument = rawCurrency ?? account.instrument
+  const description = extractDescription(row)
+  // Use Y-m-d format for hash inputs, matching data-importer's normalizeDate output.
+  const dateForHash = formatDateOnly(date)
+  const movementId = extractMovementId(row, account.id, amount, dateForHash, description)
+
+  const merchantTitle = extractMerchantTitle(row)
+  // Avoid setting merchant to the same text as the comment to reduce noise.
+  const merchant = merchantTitle != null && merchantTitle !== description
+    ? { fullTitle: merchantTitle, mcc: null, location: null } as const
+    : null
 
   return {
     hold,
@@ -208,24 +354,42 @@ function convertTransaction (
         fee: 0
       }
     ],
-    merchant: null,
-    comment: trimOrUndefined(row.Description) ?? null
+    merchant,
+    comment: description !== '' ? description : null
   }
 }
 
 export function convertTransactions (
   booked: CardTransactionRow[],
   pending: CardTransactionRow[],
-  accounts: AccountOrCard[]
+  accounts: AccountOrCard[],
+  fromDate?: Date,
+  toDate?: Date
 ): Transaction[] {
   const accountIndex = buildAccountIndex(accounts)
   const out: Transaction[] = []
   const dedupe = new Set<string>()
+  // Secondary dedup (data-importer's deduplicateByDescriptionDate).
+  const contentDedupe = new Map<string, string>()
+
+  // Date boundaries for filtering (matching data-importer's filterTransactions
+  // which enforces notBefore/notAfter on every transaction).
+  const fromMs = fromDate != null ? fromDate.getTime() : undefined
+  const toMs = toDate != null ? toDate.getTime() : undefined
 
   for (const [rows, hold] of [[booked, false], [pending, true]] as const) {
     for (const row of rows) {
       const converted = convertTransaction(row, hold, accountIndex)
       if (converted == null) {
+        continue
+      }
+
+      // Date range enforcement (matching data-importer's filterTransactions).
+      const txnMs = converted.date.getTime()
+      if (fromMs != null && txnMs < fromMs) {
+        continue
+      }
+      if (toMs != null && txnMs > toMs) {
         continue
       }
 
@@ -239,6 +403,20 @@ export function convertTransactions (
         continue
       }
 
+      // Secondary dedup by content: description + date + amount.
+      // Data-importer uses toDateString() (Y-m-d only) for the content key, NOT full ISO timestamp.
+      // If both have distinct non-empty movement IDs, they are genuinely different transactions.
+      const dateOnly = formatDateOnly(converted.date)
+      const contentKey = `${movementAccountId}|${converted.comment ?? ''}|${dateOnly}|${movementSum}`
+      const previousId = contentDedupe.get(contentKey)
+      if (previousId !== undefined) {
+        const currentId = movement.id ?? ''
+        if (currentId === '' || previousId === '' || currentId === previousId) {
+          continue
+        }
+      }
+      contentDedupe.set(contentKey, movement.id ?? '')
+
       dedupe.add(dedupeKey)
       out.push(converted)
     }
@@ -246,4 +424,103 @@ export function convertTransactions (
 
   out.sort((left, right) => left.date.getTime() - right.date.getTime())
   return out
+}
+
+// ─── Multi-currency helpers ───────────────────────────────────────────────────
+
+// Extract all plausible account identifiers from a transaction row
+// (matching data-importer's collectAccountCurrencies which checks
+// AccountIban, AccountIbanEncrypted, MainAccountID).
+function extractTransactionAccountKeys (txn: CardTransactionRow): string[] {
+  const candidates: Array<string | undefined> = [
+    txn.AccountIban,
+    txn.AccountIbanEncrypted,
+    txn.MainAccountID != null ? String(txn.MainAccountID) : undefined,
+    txn.accountId,
+    txn.sourceAccountId
+  ]
+  return candidates
+    .filter((v): v is string => v != null && v.trim() !== '')
+    .map(v => v.trim())
+}
+
+// Extract currency from a transaction row using the full fallback chain
+// (Ccy, then PSD2 nested fields) — matching normalizeTransactionCurrency
+// but without an account fallback (returns undefined when unknown).
+function extractTransactionCurrency (txn: CardTransactionRow): string | undefined {
+  const direct = normalizeCurrencyToken(String(txn.Ccy ?? ''))
+  if (direct != null) {
+    return direct
+  }
+  const nested = txn.transactionAmount?.currency ??
+    (isAmountObject(txn.amount) ? txn.amount.currency : undefined) ??
+    txn.currency
+  if (nested != null) {
+    return normalizeCurrencyToken(String(nested))
+  }
+  return undefined
+}
+
+// ─── Multi-currency account splitting ──────────────────────────────────────────
+// Matching data-importer's splitAccountsByCurrency: detects accounts with transactions
+// in multiple currencies and creates scoped accounts (baseId#CURRENCY) for each.
+
+export function splitAccountsByCurrency (
+  accounts: ParsedAccountRow[],
+  allTransactions: CardTransactionRow[]
+): ParsedAccountRow[] {
+  // Collect all currencies seen per account (by sync ID match).
+  const accountCurrencies = new Map<string, Set<string>>()
+
+  const syncIdToAccountId = new Map<string, string>()
+  for (const account of accounts) {
+    accountCurrencies.set(account.id, new Set(account.instrument !== '' ? [account.instrument] : []))
+    syncIdToAccountId.set(account.id, account.id)
+    syncIdToAccountId.set(account.id.toUpperCase(), account.id)
+    for (const syncId of account.syncIds) {
+      syncIdToAccountId.set(syncId, account.id)
+      syncIdToAccountId.set(syncId.toUpperCase(), account.id)
+    }
+  }
+
+  for (const txn of allTransactions) {
+    // Match transaction to account using all identifier fields
+    // (data-importer checks AccountIban, AccountIbanEncrypted, MainAccountID).
+    const keys = extractTransactionAccountKeys(txn)
+    let matchedAccountId: string | undefined
+    for (const key of keys) {
+      matchedAccountId = syncIdToAccountId.get(key) ?? syncIdToAccountId.get(key.toUpperCase())
+      if (matchedAccountId != null) break
+    }
+    if (matchedAccountId == null) continue
+
+    // Use full currency extraction chain (Ccy + PSD2 nested fields).
+    const ccy = extractTransactionCurrency(txn)
+    if (ccy != null) {
+      accountCurrencies.get(matchedAccountId)?.add(ccy)
+    }
+  }
+
+  const result: ParsedAccountRow[] = []
+  for (const account of accounts) {
+    const currencies = accountCurrencies.get(account.id)
+    if (currencies == null || currencies.size <= 1) {
+      result.push(account)
+      continue
+    }
+
+    // Multi-currency: create scoped accounts.
+    for (const ccy of currencies) {
+      const scopedId = `${account.id}#${ccy}`
+      result.push({
+        ...account,
+        id: scopedId,
+        instrument: ccy,
+        title: `${account.title} (${ccy})`,
+        syncIds: uniqueStrings([scopedId, account.id, account.iban, ...account.syncIds])
+      })
+    }
+  }
+
+  return result
 }
